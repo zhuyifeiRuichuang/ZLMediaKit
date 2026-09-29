@@ -23,6 +23,8 @@ jobs:
     env:
       VERSION: ${{ github.event.inputs.version }}
       IMAGE: ghcr.io/zhuyifeiruichuang/zlmediakit
+      # ZLMediaKit 上游默认 secret：部署使用该值会被服务端拒绝并随机重写（见 k8s job 断言 1/5）
+      DEFAULT_SECRET: 035c73f7-bb6b-4889-a715-d9eb2d1925cc
     steps:
       - name: Checkout（取 deploy/ 编排文件）
         uses: actions/checkout@v4
@@ -62,6 +64,19 @@ jobs:
           echo "!! 容器未按时转为 healthy，输出日志："
           docker compose logs --tail 200 zlmediakit
           exit 1
+
+      - name: 断言 - 配置 secret 合法（非上游默认）且未被容器改写
+        run: |
+          set -e
+          # 若使用的是上游默认 secret，服务端会随机重写配置文件；此前 config 为可写挂载，
+          # 测试在启动后重读被改写的文件，导致误判通过（config 已改为只读挂载暴露该问题）
+          SECRET=$(sed -n 's/^secret=//p' deploy/config/config.ini | head -1 | tr -d '\r')
+          echo "配置 secret: ${SECRET}"
+          [ -n "$SECRET" ] || { echo "!! 未取到 secret"; exit 1; }
+          [ "$SECRET" != "$DEFAULT_SECRET" ] || { echo "!! 使用了上游默认 secret"; exit 1; }
+          cur=$(docker exec zlmediakit bash -c "sed -n 's/^secret=//p' /opt/media/conf/config.ini | head -1 | tr -d '\r'")
+          echo "容器内 secret: ${cur}"
+          [ "$cur" = "$SECRET" ] || { echo "!! 容器内配置已被改写（配置未生效或被随机重写）"; exit 1; }
 
       - name: 冒烟测试（HTTP API + 端口监听）
         run: |
@@ -203,7 +218,23 @@ jobs:
           kubectl -n "$NS" wait --for=condition=Available "deploy/zlmediakit" --timeout=300s
           kubectl -n "$NS" get pods -l app=zlmediakit -o wide
 
-      - name: 断言 1/4 - Pod 使用指定版本镜像、Ready 且未重启
+      - name: 断言 1/5 - 配置 secret 合法（非上游默认）且容器内未被改写
+        run: |
+          set -e
+          # 背景：ZLMediaKit 启动时若发现 api.secret 为上游默认值或为空，会拒绝使用并
+          # 随机生成新 secret 写回配置文件(server/main.cpp:300)。ConfigMap 只读写不回去，
+          # 于是运行实例持有的是无人知晓的随机 secret，任何来源的 API 调用都会返回
+          # code=-100 "Please login first"（run 36556076125/36557347879 实测）。
+          SECRET=$(sed -n 's/^[[:space:]]*secret=//p' deploy/k8s/configmap.yaml | head -1 | tr -d '\r')
+          echo "配置 secret: ${SECRET}"
+          [ -n "$SECRET" ] || { echo "!! 未取到 secret"; exit 1; }
+          [ "$SECRET" != "$DEFAULT_SECRET" ] || { echo "!! 使用了上游默认 secret"; exit 1; }
+          cur=$(kubectl -n "$NS" exec deploy/zlmediakit -- \
+            bash -c "sed -n 's/^secret=//p' /opt/media/conf/config.ini | head -1 | tr -d '\r'")
+          echo "容器内 secret: ${cur}"
+          [ "$cur" = "$SECRET" ] || { echo "!! 容器内 secret 与 ConfigMap 不一致"; exit 1; }
+
+      - name: 断言 2/5 - Pod 使用指定版本镜像、Ready 且未重启
         run: |
           set -e
           img=$(kubectl -n "$NS" get pod -l app=zlmediakit -o jsonpath='{.items[0].spec.containers[0].image}')
@@ -219,7 +250,7 @@ jobs:
           # 若 liveness/就绪配置不当导致反复重启，restartCount 会增长
           [ "$restarts" = "0" ]    || { echo "!! Pod 发生重启($restarts)"; exit 1; }
 
-      - name: 断言 2/4 - ConfigMap / Secret 挂载生效
+      - name: 断言 3/5 - ConfigMap / Secret 挂载生效
         run: |
           set -e
           # Secret 经 subPath 挂到 /opt/media/bin/default.pem；ConfigMap 挂到 /opt/media/conf
@@ -227,33 +258,7 @@ jobs:
             bash -c 'test -s /opt/media/bin/default.pem && test -s /opt/media/conf/config.ini \
                      && echo "MOUNTS_OK" && ls -l /opt/media/bin/default.pem /opt/media/conf/config.ini'
 
-      - name: 诊断（临时排查用）：生效配置 / loopback / 登录流程 / ClusterIP
-        run: |
-          set -e
-          SECRET=$(sed -n 's/^[[:space:]]*secret=//p' deploy/k8s/configmap.yaml | head -1 | tr -d '\r')
-          echo "==> 容器内生效配置的 secret 行（cat -A 显示隐藏字符）"
-          kubectl -n "$NS" exec deploy/zlmediakit -- \
-            bash -c 'grep -a secret= /opt/media/conf/config.ini | head -3 | cat -A'
-          echo "==> 容器内 loopback 请求"
-          kubectl -n "$NS" exec deploy/zlmediakit -- \
-            bash -c "exec 3<>/dev/tcp/127.0.0.1/80; \
-                     printf 'GET /index/api/getServerConfig?secret=${SECRET} HTTP/1.0\r\n\r\n' >&3; \
-                     head -c 400 <&3"
-          echo "==> runner 侧（hostNetwork 端口映射）请求"
-          curl -s "http://127.0.0.1:${PORT_HTTP}/index/api/getServerConfig?secret=${SECRET}" | head -c 400
-          echo
-          echo "==> 登录流程（MD5(zlmediakit:secret:cookie)）"
-          JAR=/tmp/zlm-cookie.jar; rm -f "$JAR"
-          r1=$(curl -s -c "$JAR" -b "$JAR" "http://127.0.0.1:${PORT_HTTP}/index/api/getServerConfig?secret=${SECRET}")
-          COOKIE=$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("cookie",""))' <<< "$r1")
-          DIGEST=$(python3 -c "import hashlib,sys; print(hashlib.md5(('zlmediakit:'+sys.argv[1]+':'+sys.argv[2]).encode()).hexdigest())" "$SECRET" "$COOKIE")
-          echo "cookie=${COOKIE} digest=${DIGEST}"
-          if [ -n "$COOKIE" ]; then
-            echo "login resp: $(curl -s -c "$JAR" -b "$JAR" "http://127.0.0.1:${PORT_HTTP}/index/api/login?digest=${DIGEST}")"
-            echo "after login: $(curl -s -c "$JAR" -b "$JAR" "http://127.0.0.1:${PORT_HTTP}/index/api/getServerConfig?secret=${SECRET}" | head -c 300)"
-          fi
-
-      - name: 断言 3/4 - hostNetwork 端口经节点对外可达（HTTP API + 1935/554 监听）
+      - name: 断言 4/5 - hostNetwork 端口经节点对外可达（HTTP API + 1935/554 监听）
         run: |
           set -e
           # 从 k8s 自己的 ConfigMap 取 secret（缩进 4 空格），CRLF 会污染 URL 必须 strip CR
@@ -266,9 +271,8 @@ jobs:
           head -c 300 /tmp/api.json; echo
           [ "$code" = "200" ] || { echo "!! API HTTP $code"; exit 1; }
           # 返回的 JSON 为 "code" : 0（冒号两侧可能有空格），故用 python 严格解析而非字符串匹配
-          # 临时：本轮先行降级为告警，待诊断步骤输出定位根因后恢复为硬性断言
           python3 -c 'import json,sys; d=json.load(open("/tmp/api.json")); sys.exit(0 if d.get("code")==0 else 1)' \
-            || { echo "!! WARN API 业务 code != 0（本轮仅告警，待定位）"; }
+            || { echo "!! API 业务 code != 0"; exit 1; }
 
           echo "==> 端口监听检查（RTMP $PORT_RTMP / RTSP $PORT_RTSP）"
           for p in "$PORT_RTMP" "$PORT_RTSP"; do
@@ -276,7 +280,7 @@ jobs:
             echo "端口 $p OK"
           done
 
-      - name: 断言 4/4 - ClusterIP Service 连通（endpoints 就绪 + Pod 内 HTTP 访问）
+      - name: 断言 5/5 - ClusterIP Service 连通（endpoints 就绪 + Pod 内 HTTP 访问）
         run: |
           set -e
           kubectl -n "$NS" get endpoints zlmediakit -o yaml
@@ -297,10 +301,9 @@ jobs:
                      printf 'GET /index/api/version?secret=${SECRET} HTTP/1.0\r\n\r\n' >&3; \
                      head -c 400 <&3")
           echo "HTTP 响应: $resp"
-          # 临时：本轮先行降级为告警，待诊断步骤输出定位根因后恢复为硬性断言
-          echo "$resp" | head -n 1 | grep -q "200" || { echo "!! WARN ClusterIP Service 未返回 200"; }
+          echo "$resp" | head -n 1 | grep -q "200" || { echo "!! ClusterIP Service 未返回 200"; exit 1; }
           echo "$resp" | grep -Eq '"code"[[:space:]]*:[[:space:]]*0' \
-            || { echo "!! WARN ClusterIP Service 响应业务 code != 0"; }
+            || { echo "!! ClusterIP Service 响应业务 code != 0"; exit 1; }
 
       - name: 失败诊断输出
         if: failure()
