@@ -356,7 +356,9 @@ static inline void addHttpListener(){
             }
 #ifdef ENABLE_MYSQL
             catch (SqlException &ex) {
-                responseApi(API::SqlFailed, StrPrinter << "操作数据库失败:" << ex.what() << ":" << ex.getSql(), invoker, &ex);
+                // SqlException 继承自 std::exception，与 ApiRetException 无继承关系，
+                // 不能作为 responseApi 的第 4 参数(ApiRetException*)，故传 nullptr 仅携带错误信息。
+                responseApi(API::SqlFailed, StrPrinter << "操作数据库失败:" << ex.what() << ":" << ex.getSql(), invoker, nullptr);
             }
 #endif // ENABLE_MYSQL
             catch (std::exception &ex) {
