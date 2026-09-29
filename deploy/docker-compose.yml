@@ -2,7 +2,7 @@ name: zlmediakit
 
 services:
   zlmediakit:
-    image: ${ZLM_IMAGE:-ghcr.io/zhuyifeiRuichuang/zlmediakit}:${ZLM_VERSION:-latest}
+    image: ${ZLM_IMAGE:-ghcr.io/zhuyifeiruichuang/zlmediakit}:${ZLM_VERSION:-latest}
     container_name: zlmediakit
     restart: unless-stopped
     network_mode: host

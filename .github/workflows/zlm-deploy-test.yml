@@ -1,0 +1,77 @@
+name: zlm-deploy-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '镜像 tag（与 zlm-build-images 产出一致，不要加 v 前缀）'
+        required: true
+        default: '1.0.0'
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  deploy-test:
+    name: deploy-test-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ github.event.inputs.version }}
+      IMAGE: ghcr.io/zhuyifeiruichuang/zlmediakit
+    steps:
+      - name: Checkout（取 deploy/ 编排文件）
+        uses: actions/checkout@v4
+
+      - name: 登录 GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: 拉取镜像并校验架构（仅 amd64）
+        run: |
+          docker pull "$IMAGE:$VERSION"
+          arch=$(docker image inspect "$IMAGE:$VERSION" --format '{{.Architecture}}')
+          echo "镜像架构: $arch"
+          [ "$arch" = "amd64" ] || { echo "!! 期望 amd64，实际 $arch"; exit 1; }
+
+      - name: docker compose 部署
+        working-directory: deploy
+        run: |
+          cp .env.example .env
+          docker compose up -d
+          docker compose ps
+
+      - name: 等待容器健康（120s 内转 healthy）
+        working-directory: deploy
+        run: |
+          cid=$(docker compose ps -q zlmediakit)
+          echo "container: $cid"
+          for i in $(seq 1 60); do
+            st=$(docker inspect --format '{{.State.Health.Status}}' "$cid")
+            echo "health: $st ($i)"
+            [ "$st" = "healthy" ] && exit 0
+            sleep 2
+          done
+          echo "!! 容器未按时转为 healthy，输出日志："
+          docker compose logs --tail 200 zlmediakit
+          exit 1
+
+      - name: 冒烟测试（HTTP API + 端口监听）
+        run: |
+          SECRET=$(grep -E '^secret=' deploy/config/config.ini | cut -d= -f2)
+          echo "==> HTTP API getServerConfig"
+          code=$(curl -s -o /tmp/api.json -w '%{http_code}' "http://127.0.0.1/index/api/getServerConfig?secret=${SECRET}")
+          head -c 300 /tmp/api.json; echo
+          [ "$code" = "200" ] || { echo "!! API HTTP $code"; exit 1; }
+          grep -q '"code":0' /tmp/api.json || { echo "!! API 业务 code != 0"; exit 1; }
+          echo "==> 端口监听检查（1935/554）"
+          for p in 1935 554; do
+            (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null || { echo "!! 端口 $p 未监听"; exit 1; }
+            echo "端口 $p OK"
+          done
+          echo "==> 部署测试全部通过"
+
+      - name: 清理
+        if: always()
+        working-directory: deploy
+        run: docker compose down -v
