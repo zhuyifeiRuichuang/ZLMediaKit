@@ -177,6 +177,16 @@ jobs:
             "$RUNNER_TEMP/manifests/deployment.yaml"
           grep -n 'image:' "$RUNNER_TEMP/manifests/deployment.yaml"
 
+      - name: 预检 manifests（server dry-run，由 API Server 严格校验字段，不落库）
+        run: |
+          set -e
+          # 命名空间需先真实创建，后续对象才能做服务端校验
+          kubectl apply -f "$RUNNER_TEMP/manifests/namespace.yaml"
+          for f in configmap.yaml secret.yaml service.yaml deployment.yaml; do
+            echo "==> dry-run $f"
+            kubectl apply --dry-run=server -f "$RUNNER_TEMP/manifests/$f"
+          done
+
       - name: 应用 manifests（ns -> configmap -> secret -> svc -> deployment）
         run: |
           set -e
@@ -251,11 +261,18 @@ jobs:
           echo "clusterIP: $CLUSTER_IP"
           [ -n "$CLUSTER_IP" ] || { echo "!! Service 无 ClusterIP"; exit 1; }
 
+          # /index/api/version 含 CHECK_SECRET（仅源 IP 为 127.0.0.1 时免密）；
+          # Pod 经 ClusterIP 访问的源 IP 是节点 IP，必须带上 secret
+          SECRET=$(sed -n 's/^[[:space:]]*secret=//p' deploy/k8s/configmap.yaml | head -1 | tr -d '\r')
           # 镜像内无 curl，用 bash 内置 /dev/tcp 完成一次真实 HTTP 请求，验证 Service 转发链路
           resp=$(kubectl -n "$NS" exec deploy/zlmediakit -- \
-            bash -c "exec 3<>/dev/tcp/${CLUSTER_IP}/80; printf 'GET /index/api/version HTTP/1.0\r\n\r\n' >&3; head -n 1 <&3")
-          echo "HTTP 响应首行: $resp"
-          echo "$resp" | grep -q "200" || { echo "!! ClusterIP Service 未返回 200"; exit 1; }
+            bash -c "exec 3<>/dev/tcp/${CLUSTER_IP}/80; \
+                     printf 'GET /index/api/version?secret=${SECRET} HTTP/1.0\r\n\r\n' >&3; \
+                     head -c 400 <&3")
+          echo "HTTP 响应: $resp"
+          echo "$resp" | head -n 1 | grep -q "200" || { echo "!! ClusterIP Service 未返回 200"; exit 1; }
+          echo "$resp" | grep -Eq '"code"[[:space:]]*:[[:space:]]*0' \
+            || { echo "!! ClusterIP Service 响应业务 code != 0"; exit 1; }
 
       - name: 失败诊断输出
         if: failure()
