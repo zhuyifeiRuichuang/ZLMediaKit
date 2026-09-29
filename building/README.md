@@ -46,8 +46,8 @@
 | 制品命名 | `mediaserver-linux-<arch>-<version>.tar.gz`、`mkapi-linux-<arch>-<version>.tar.gz` | 架构与版本均显式，无 `unknown` |
 | 版本号 | 手动填写、**不加 `v` 前缀**，最终版本即所填 | 满足要求 |
 | 推送目标 | 二进制 → GitHub Release 附件；镜像 → `ghcr.io/zhuyifeiRuichuang/zlmediakit` | 使用提供的 GitHub Token 即可，无需 Docker Hub 凭据 |
-| 基础镜像 | `debian:13-slim`（glibc，兼容性最佳，约 27MB） | 在兼容性范围内取最新稳定版、最精简 |
-| 功能矩阵 | 启用 `API/WEBRTC/SRT/SCTP/HLS/MP4/RTPPROXY/SERVER`；关闭 `FFMPEG/PYTHON/TESTS/PLAYER/MYSQL` | 生产可用、依赖最干净；PLAYER 依赖 FFMPEG 故一并关闭 |
+| 基础镜像 | `ubuntu:24.04`（glibc，与编译 runner 同发行版） | 编译在 ubuntu-24.04 runner 完成，二进制动态链接 ubuntu 的 libav*/libmysqlclient/libpython；运行时必须同发行版以保证 SONAME 一致。用户已确认接受更大镜像体积 |
+| 功能矩阵 | 启用 `API/WEBRTC/SRT/SCTP/HLS/MP4/RTPPROXY/SERVER/PLAYER/FFMPEG/PYTHON/MYSQL`；仅关闭 `TESTS` | 组件齐全、生产可用；接受更大的制品与镜像体积（用户明确要求） |
 | 镜像装配 | **从预编译制品装配**（非镜像内编译） | 多架构干净、可复现、体积小 |
 | 防覆盖 | 脚本放 `building/`、部署放 `deploy/`；workflow 文件加 `zlm-` 前缀，不与上游 `docker.yml`/`linux.yml` 同名冲突 | 规避 `git pull` 上游导致配置被覆盖 |
 | 子模块 | workflow 内将子模块 URL 改写为 GitHub 镜像 | 规避 gitee 在 GitHub Runner 不稳，防止构建故障 |
@@ -57,7 +57,7 @@
 ```
 building/
 ├── build.sh              # 原生编译 + 双组件打包（amd64/arm64）
-├── Dockerfile.runtime    # 运行时镜像（debian:13-slim，从制品装配）
+├── Dockerfile.runtime    # 运行时镜像（ubuntu:24.04，从制品装配）
 └── README.md             # 本文件
 .github/workflows/
 ├── zlm-build-artifacts.yml  # 手动触发：编译 + 打包 + 创建 GitHub Release
@@ -69,12 +69,16 @@ deploy/                   # 见 ../deploy/README.md
 
 | 开关 | 值 | 说明 |
 | --- | --- | --- |
-| ENABLE_API | ON | 产出 mkapi 组件 |
+| ENABLE_API | ON | 产出 mkapi 组件（C API SDK） |
 | ENABLE_WEBRTC | ON | 需 SRTP + OpenSSL（系统库） |
-| ENABLE_SRT | ON | 自带 srt/ 源码，无外部依赖 |
+| ENABLE_SRT | ON | 自带 srt/ 源码，静态链入，无外部运行时依赖 |
 | ENABLE_SCTP | ON | 可选 usrsctp；找不到则自动关闭 datachannel |
 | ENABLE_HLS / MP4 / RTPPROXY / SERVER | ON | 核心功能 |
-| ENABLE_FFMPEG / PLAYER / PYTHON / TESTS / MYSQL | OFF | 精简依赖；PLAYER 依赖 FFMPEG |
+| ENABLE_PLAYER | ON | 点播/播放，依赖 FFMPEG |
+| ENABLE_FFMPEG | ON | 媒体文件解封装/转码，动态链接发行版 libav*（运行时装 `ffmpeg`） |
+| ENABLE_PYTHON | ON | 内嵌 Python 解释器（pybind11::embed），动态链接 libpython（运行时装 `python3`） |
+| ENABLE_MYSQL | ON | MySQL 客户端钩子，动态链接 libmysqlclient（运行时装 `libmysqlclient21`） |
+| ENABLE_TESTS | OFF | 开发自测用，非运行时组件，默认不打包 |
 
 ### 手动触发顺序
 
@@ -86,6 +90,10 @@ deploy/                   # 见 ../deploy/README.md
 ### 本地复用（可选）
 
 ```bash
-# 在装有 cmake/gcc/libssl-dev/libsrtp2-dev 的 Linux 上
+# 在装有编译依赖的 Linux（ubuntu 24.04 推荐）上：
+#   build-essential cmake git pkg-config
+#   libssl-dev libsrtp2-dev libusrsctp-dev
+#   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libavfilter-dev
+#   python3-dev libmysqlclient-dev
 SRC=$(pwd) OUT=$(pwd)/output bash building/build.sh amd64 1.0.0
 ```

@@ -57,6 +57,15 @@ jobs:
           # usrsctp 可选：提供则开启 datachannel，缺失则自动关闭（不报错）
           sudo apt-get install -y --no-install-recommends libusrsctp-dev || \
             echo "libusrsctp-dev 不可用，SCTP/datachannel 将被自动关闭"
+          # FFMPEG（PLAYER 解封装/转码）构建期开发库
+          sudo apt-get install -y --no-install-recommends \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libswresample-dev libavfilter-dev
+          # PYTHON 内嵌解释器（pybind11::embed）构建期头文件
+          sudo apt-get install -y --no-install-recommends python3-dev
+          # MYSQL 客户端钩子构建期开发库
+          sudo apt-get install -y --no-install-recommends libmysqlclient-dev || \
+            echo "libmysqlclient-dev 不可用，MYSQL 钩子将被自动关闭"
 
       - name: 编译并打包
         env:

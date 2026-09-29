@@ -15,6 +15,13 @@
 #   2. 显式传入 version，制品名严格为 mediaserver-linux-<arch>-<version>.tar.gz，
 #      架构与版本均显式，绝不出现 unknown。
 #   3. git 信息（commit/branch）由仓库本身提供，CMake 会写入真实版本，消除 Git_Unkown。
+#   4. 功能矩阵「组件齐全」：在兼容性范围内启用全部生产可用组件，接受更大的制品/镜像体积。
+#      - 编译在 ubuntu-24.04 runner 完成，二进制动态链接 ubuntu 的
+#        libav*(FFMPEG) / libmysqlclient(MySQL) / libpython(Python) 等发行版库，
+#        因此运行时镜像也必须使用 ubuntu:24.04（SONAME 一致），否则启动报
+#        “error while loading shared libraries”。
+#   5. 输出目录纠正：ZLMediaKit 的 CMake 把产物写到 <源码根>/release/linux/<Model>/，
+#      而非 build/ 目录内。
 #
 set -euo pipefail
 
@@ -26,14 +33,29 @@ SRC="${SRC:-$PWD}"
 OUT="${OUT:-$SRC/output}"
 BUILD="$SRC/build"
 
+# ZLMediaKit 真实产物目录（注意：在源码根下，不在 build/ 内）
+REL="$SRC/release/linux/$MODEL"
+
 echo "==> [ZLMediaKit] 开始编译 arch=$ARCH version=$VERSION model=$MODEL"
+echo "==> 源码根: $SRC"
+echo "==> 产物目录: $REL"
 
 cd "$SRC"
 
-# ---- 配置（功能矩阵：生产可用、依赖最干净、不含 FFMPEG） ----
-# 启用: API(产出 mkapi) / WEBRTC(需 SRTP+OpenSSL) / SRT / SCTP(datachannel, 可选) /
-#       HLS / MP4 / RTPPROXY / SERVER
-# 关闭: FFMPEG(Python 插件随之无意义) / TESTS / PLAYER(依赖 FFMPEG) / MYSQL
+# ---- 配置（功能矩阵：组件齐全、生产可用，接受更大体积） ----
+# 启用:
+#   API          -> 产出 mkapi（C API SDK：libmk_api.so + 头文件）
+#   WEBRTC       -> 需 SRTP + OpenSSL
+#   SRT          -> 自带源码，静态链接（无需运行时 srt 库）
+#   SCTP         -> datachannel（可选，缺失则自动关闭）
+#   HLS / MP4 / RTPPROXY / SERVER
+#   PLAYER       -> 依赖 FFMPEG（点播/播放）
+#   FFMPEG       -> 媒体文件解封装/转码（动态链接发行版 libav*）
+#   PYTHON       -> 内嵌 Python 解释器（pybind11::embed，需 python3-dev）
+#   MYSQL        -> MySQL 客户端钩子（动态链接 libmysqlclient）
+#   OPENSSL      -> HTTPS/RTSPS/WebRTC
+# 关闭:
+#   TESTS        -> 开发自测用，非运行时组件
 cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE="$MODEL" \
   -DENABLE_API=ON \
   -DENABLE_WEBRTC=ON \
@@ -43,31 +65,39 @@ cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE="$MODEL" \
   -DENABLE_MP4=ON \
   -DENABLE_RTPPROXY=ON \
   -DENABLE_SERVER=ON \
-  -DENABLE_PLAYER=OFF \
+  -DENABLE_PLAYER=ON \
+  -DENABLE_FFMPEG=ON \
+  -DENABLE_PYTHON=ON \
+  -DENABLE_MYSQL=ON \
   -DENABLE_TESTS=OFF \
-  -DENABLE_FFMPEG=OFF \
-  -DENABLE_PYTHON=OFF \
-  -DENABLE_MYSQL=OFF \
   -DENABLE_OPENSSL=ON
 
 cmake --build "$BUILD" -j "$(nproc)"
 
-REL="$BUILD/release/linux/$MODEL"
 if [ ! -x "$REL/MediaServer" ]; then
   echo "!! MediaServer 未生成，编译失败" >&2
+  exit 1
+fi
+if [ ! -e "$REL/libmk_api.so" ]; then
+  echo "!! libmk_api.so 未生成（ENABLE_API 应开启），编译失败" >&2
   exit 1
 fi
 
 mkdir -p "$OUT"
 
-# ---- 组件 1: mediaserver（主服务运行时） ----
+# ---- 组件 1: mediaserver（主服务运行时，组件齐全） ----
 MS="$OUT/stage/mediaserver"
 rm -rf "$MS"; mkdir -p "$MS/bin" "$MS/conf"
 cp "$REL/MediaServer"        "$MS/bin/"
 cp "$SRC/default.pem"        "$MS/bin/"
 cp -r "$SRC/www"             "$MS/bin/www"
 cp "$SRC/conf/config.ini"    "$MS/conf/"
+# 可选调试符号（Release + objcopy 时生成）
 [ -f "$REL/MediaServer.debug" ] && cp "$REL/MediaServer.debug" "$MS/bin/" || true
+# 防御性：把产物目录中可能出现的其它共享库一并带入（如未来开启某动态组件）
+for so in "$REL"/*.so*; do
+  [ -e "$so" ] && cp -n "$so" "$MS/bin/" || true
+done
 tar -C "$MS" -czf "$OUT/mediaserver-linux-$ARCH-$VERSION.tar.gz" .
 
 # ---- 组件 2: mkapi（C API SDK：库 + 头文件） ----
