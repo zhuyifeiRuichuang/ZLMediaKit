@@ -67,5 +67,7 @@ spec:
           configMap:
             name: zlm-config
         - name: cert
+          # Secret 卷必须用 secretName（不是 name）；
+          # 实测写成 name 会被 API Server 拒绝: strict decoding error: unknown field "spec.template.spec.volumes[1].secret.name"
           secret:
-            name: zlm-cert
+            secretName: zlm-cert
