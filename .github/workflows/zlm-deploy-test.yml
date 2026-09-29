@@ -295,11 +295,12 @@ jobs:
           # /index/api/version 含 CHECK_SECRET（仅源 IP 为 127.0.0.1 时免密）；
           # Pod 经 ClusterIP 访问的源 IP 是节点 IP，必须带上 secret
           SECRET=$(sed -n 's/^[[:space:]]*secret=//p' deploy/k8s/configmap.yaml | head -1 | tr -d '\r')
-          # 镜像内无 curl，用 bash 内置 /dev/tcp 完成一次真实 HTTP 请求，验证 Service 转发链路
+          # 必须显式要求 Connection: close 并读满到 EOF：HTTP 头本身就有约 400 字节，
+          # 只读前 400 字节会把 JSON body 截断在外，grep 不到 "code" 而误判（run 36558742514 实测）
           resp=$(kubectl -n "$NS" exec deploy/zlmediakit -- \
             bash -c "exec 3<>/dev/tcp/${CLUSTER_IP}/80; \
-                     printf 'GET /index/api/version?secret=${SECRET} HTTP/1.0\r\n\r\n' >&3; \
-                     head -c 400 <&3")
+                     printf 'GET /index/api/version?secret=${SECRET} HTTP/1.0\r\nConnection: close\r\n\r\n' >&3; \
+                     timeout 20 head -c 2000 <&3")
           echo "HTTP 响应: $resp"
           echo "$resp" | head -n 1 | grep -q "200" || { echo "!! ClusterIP Service 未返回 200"; exit 1; }
           echo "$resp" | grep -Eq '"code"[[:space:]]*:[[:space:]]*0' \
