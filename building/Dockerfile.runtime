@@ -25,7 +25,8 @@ ENV TZ=Asia/Shanghai \
 # 运行时依赖（与编译期动态链接一一对应）:
 #   ffmpeg           提供 libavcodec/libavformat/libavutil/libswscale/libswresample/libavfilter 运行时
 #   libmysqlclient21  MySQL 客户端钩子运行时（libmysqlclient.so.21）
-#   python3          内嵌 Python 解释器运行时（libpython3.12）
+#   python3          内嵌 Python 解释器运行时
+#   libpython3.12t64 libpython3.12.so.1.0 共享库本体（noble 中 python3 依赖链不自动拉取，deploy-test run 36543592100 实测缺失）
 #   libssl3          OpenSSL 3 运行时（WebRTC/HTTPS/RTSPS）
 #   libsrtp2-1       SRTP 运行时（WebRTC）
 #   libusrsctp2      SCTP/datachannel 运行时（启用时）
@@ -33,7 +34,7 @@ ENV TZ=Asia/Shanghai \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates tzdata \
-      ffmpeg libmysqlclient21 python3 \
+      ffmpeg libmysqlclient21 python3 libpython3.12t64 \
       libssl3 libsrtp2-1 libusrsctp2 \
       libstdc++6 libgcc-s1 libatomic1 \
  && rm -rf /var/lib/apt/lists/* \
