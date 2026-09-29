@@ -93,7 +93,7 @@ kubectl -n zlmediakit logs -f deploy/zlmediakit
 | Job | 场景 | 环境 | 断言内容 |
 | --- | --- | --- | --- |
 | `deploy-test-compose-amd64` | docker compose | runner 原生 docker | 镜像架构=amd64、容器 healthy、配置 secret 非上游默认且未被容器改写、`getServerConfig` code=0、1935/554 监听 |
-| `deploy-test-k8s-amd64` | Kubernetes | 单节点 kind 集群（`kind create cluster` + extraPortMappings） | 见下 |
+| `deploy-test-k8s-amd64` | Kubernetes | 单节点 kind 集群（`.github/kind-config.yaml` + extraPortMappings） | 见下 |
 
 k8s job 覆盖点（5 项断言）：
 
@@ -105,7 +105,20 @@ k8s job 覆盖点（5 项断言）：
 
 编排对象在 apply 前先做 `kubectl apply --dry-run=server` 预检（由 API Server 严格校验字段，如 Secret 卷须用 `secretName`）。
 
-> 流水线使用的 kubectl / kind 版本动态取自官方源（kubectl 取 `dl.k8s.io/release/stable.txt`，kind 取 GitHub `latest` release），不硬编码版本号。
+### 流水线自身的工程约定
+
+按 GitHub 官方《Security hardening for GitHub Actions》与 Actions 生态现状梳理，与上面两个 job 的行为一一对应：
+
+| 项 | 做法 | 依据 |
+| --- | --- | --- |
+| k8s 工具来源 | 直接使用 GitHub 官方 `ubuntu-24.04` runner 镜像**预装**的 Kind / Kubectl，不在 CI 中联网下载二进制 | 见 `actions/runner-images` 的 Ubuntu2404 工具清单。少一个外网依赖失败面、省去下载耗时，且二进制来自 GitHub 维护的镜像（有 SBOM 可核查）；代价是版本随镜像升级跟进，故 job 启动即打印 `kind version` / `kubectl version --client` 留痕 |
+| kind 集群拓扑 | 声明式入库 `.github/kind-config.yaml`，由 `kind create cluster --config` 引用 | 集群拓扑与流水线解耦，本地可复现同一套配置；hostPort 须与 job 的 `PORT_HTTP/PORT_RTMP/PORT_RTSP` 一致 |
+| action 引用方式 | `actions/checkout`、`actions/upload-artifact` 锁定到 **full commit SHA**（附对应 tag 注释） | 官方原文：“锁定到完整 SHA 是当前唯一可将 action 视为不可变发布的方式”，tag 可被仓库 owner 移动或删除 |
+| 凭证使用 | `${{ secrets.GITHUB_TOKEN }}`、`${{ github.actor }}` 先赋给 `env` 中间变量，不内联进 `run:` 脚本 | 官方针对 inline script 的脚本注入缓解措施；相较于原先的 `echo "${{ secrets.GITHUB_TOKEN }}" \| docker login` |
+| 报告呈现 | 每项断言通过后即时写入 `$GITHUB_STEP_SUMMARY`，job 页面直接显示结论表格 | 官方 Job Summary 机制，无需翻日志即可看到通过了什么 |
+| 失败取证 | 失败时执行 kind 官方诊断命令 `kind export logs` 导出节点日志，连同 describe/logs/events 由 `actions/upload-artifact` 上传（保留 7 天） | 集群在 `always()` 清理步骤即被删除，须在失败时优先固化证据 |
+| 并发互斥 | 顶层 `concurrency.group: zlm-deploy-test` + `cancel-in-progress: true` | 两个 job 共用 runner 本机端口与 kind 集群名，重复手动触发会撞资源造成假失败 |
+| 超时兜底 | 每个 job 均设 `timeout-minutes: 30` | 官方建议为所有 job 显式设置超时上限，避免异常时长期占用 runner |
 
 ## 五、部署测试建议
 

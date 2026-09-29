@@ -8,9 +8,18 @@ on:
         required: true
         default: '1.0.0'
 
+# 两个 job 共享 runner 本机端口（compose 用 80/1935/554，kind 用映射端口 30080/31935/30554）
+# 与 kind 集群名 zlm-ci，重复手动触发会撞同一批资源导致假失败；
+# 按 GitHub 官方文档用 concurrency 互斥，后触发的 run 取消在跑的旧 run。
+concurrency:
+  group: zlm-deploy-test
+  cancel-in-progress: true
+
 permissions:
   contents: read
   packages: read
+  # 失败时上传诊断日志（actions/upload-artifact）的最小需要
+  actions: write
 
 jobs:
   # Job 1: docker compose 部署测试（amd64）
@@ -23,17 +32,40 @@ jobs:
     env:
       VERSION: ${{ github.event.inputs.version }}
       IMAGE: ghcr.io/zhuyifeiruichuang/zlmediakit
-      # ZLMediaKit 上游默认 secret：部署使用该值会被服务端拒绝并随机重写（见 k8s job 断言 1/5）
+      # ZLMediaKit 上游默认 secret：部署使用该值会被服务端拒绝并随机重写（见 compose/k8s 断言）
       DEFAULT_SECRET: 035c73f7-bb6b-4889-a715-d9eb2d1925cc
     steps:
+      # GitHub 官方《Security hardening for GitHub Actions》：把第三方 action 锁定到 full commit SHA
+      # 是当前唯一能将其视为不可变引用的方式（tag 可被仓库owner移动或删除）。
       - name: Checkout（取 deploy/ 编排文件）
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: 初始化 Job Summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## zlm-deploy-test / compose-amd64"
+            echo ""
+            echo "- 镜像：\`$IMAGE:$VERSION\`"
+            echo "- runner 系统：\`$(. /etc/os-release && echo "$PRETTY_NAME")\`"
+            echo ""
+            echo "| # | 断言 | 结果 |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 登录 GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        # 官方指引：凭证、事件上下文等表达式一律先赋给中间环境变量再使用，
+        # 不直接内联进 shell 脚本，规避脚本注入。
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
 
       - name: 拉取镜像并校验架构（仅 amd64）
         run: |
+          set -euo pipefail
           docker pull "$IMAGE:$VERSION"
           arch=$(docker image inspect "$IMAGE:$VERSION" --format '{{.Architecture}}')
           echo "镜像架构: $arch"
@@ -42,6 +74,7 @@ jobs:
       - name: docker compose 部署
         working-directory: deploy
         run: |
+          set -euo pipefail
           cp .env.example .env
           # 绑定到本次测试指定的版本/镜像，避免 .env.example 默认 latest 覆盖入参
           sed -i "s|^ZLM_VERSION=.*|ZLM_VERSION=${VERSION}|" .env
@@ -53,33 +86,38 @@ jobs:
       - name: 等待容器健康（120s 内转 healthy）
         working-directory: deploy
         run: |
+          set -euo pipefail
           cid=$(docker compose ps -q zlmediakit)
           echo "container: $cid"
           for i in $(seq 1 60); do
             st=$(docker inspect --format '{{.State.Health.Status}}' "$cid")
             echo "health: $st ($i)"
-            [ "$st" = "healthy" ] && exit 0
+            # 不能写成 `[ "$st" = healthy ] && exit 0`：在 set -e 下该行返回非 0 会直接中断 job
+            if [ "$st" = "healthy" ]; then exit 0; fi
             sleep 2
           done
           echo "!! 容器未按时转为 healthy，输出日志："
           docker compose logs --tail 200 zlmediakit
           exit 1
 
-      - name: 断言 - 配置 secret 合法（非上游默认）且未被容器改写
+      - name: 断言 1/2 - 配置 secret 合法（非上游默认）且未被容器改写
         run: |
-          set -e
+          set -euo pipefail
           # 若使用的是上游默认 secret，服务端会随机重写配置文件；此前 config 为可写挂载，
           # 测试在启动后重读被改写的文件，导致误判通过（config 已改为只读挂载暴露该问题）
-          SECRET=$(sed -n 's/^secret=//p' deploy/config/config.ini | head -1 | tr -d '\r')
+          # 用 grep -m1 而非 `sed | head -1`：在 pipefail 下 head 提前退出会给上游 SIGPIPE，导致整行失败
+          SECRET=$(grep -m1 -E '^secret=' deploy/config/config.ini | tr -d '\r' | cut -d= -f2-)
           echo "配置 secret: ${SECRET}"
           [ -n "$SECRET" ] || { echo "!! 未取到 secret"; exit 1; }
           [ "$SECRET" != "$DEFAULT_SECRET" ] || { echo "!! 使用了上游默认 secret"; exit 1; }
           cur=$(docker exec zlmediakit bash -c "sed -n 's/^secret=//p' /opt/media/conf/config.ini | head -1 | tr -d '\r'")
           echo "容器内 secret: ${cur}"
           [ "$cur" = "$SECRET" ] || { echo "!! 容器内配置已被改写（配置未生效或被随机重写）"; exit 1; }
+          echo "| 1 | 配置 secret 合法（非默认）且容器内未被改写 | ✅ |" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: 冒烟测试（HTTP API + 端口监听）
+      - name: 断言 2/2 - 冒烟测试（HTTP API + 端口监听）
         run: |
+          set -euo pipefail
           # config.ini 为 CRLF 行结尾，必须 strip CR，否则 URL 内含 \r 导致 curl exit 3 (URL malformed)
           SECRET=$(grep -m1 -E '^secret=' deploy/config/config.ini | tr -d '\r' | cut -d= -f2)
           echo "==> HTTP API getServerConfig"
@@ -95,7 +133,7 @@ jobs:
             (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null || { echo "!! 端口 $p 未监听"; exit 1; }
             echo "端口 $p OK"
           done
-          echo "==> 部署测试全部通过"
+          echo "| 2 | HTTP API getServerConfig code=0 且 1935/554 监听 | ✅ |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 清理（compose）
         if: always()
@@ -117,65 +155,72 @@ jobs:
     env:
       VERSION: ${{ github.event.inputs.version }}
       IMAGE: ghcr.io/zhuyifeiruichuang/zlmediakit
+      DEFAULT_SECRET: 035c73f7-bb6b-4889-a715-d9eb2d1925cc
       NS: zlmediakit
       CLUSTER: zlm-ci
-      # hostNetwork 端口 -> runner 本机端口的映射（kind extraPortMappings）
+      # hostNetwork 端口 -> runner 本机端口的映射，必须与 .github/kind-config.yaml 的 hostPort 一致
       PORT_HTTP: 30080
       PORT_RTMP: 31935
       PORT_RTSP: 30554
     steps:
-      - name: Checkout（取 deploy/k8s 编排文件）
-        uses: actions/checkout@v4
+      - name: Checkout（取 deploy/k8s 编排文件与 kind 集群配置）
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: 校验 runner 预装 k8s 工具链
+        run: |
+          set -euo pipefail
+          # GitHub 官方 ubuntu-24.04 runner 镜像已预装 Kind / Kubectl / Helm（工具清单见
+          # https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md），
+          # 无需在 CI 里联网下载二进制：少一次外网依赖失败面、启动更快、二进制来自 GitHub 维护的镜像。
+          # 代价是版本随 runner 镜像升级而跟进，故此处打印版本用于留痕追溯。
+          for bin in kind kubectl; do
+            path=$(command -v "$bin" || true)
+            [ -n "$path" ] || { echo "!! runner 未预装 $bin，请确认 runner 镜像"; exit 1; }
+            echo "$bin -> $path"
+          done
+          echo "kind    : $(kind version)"
+          echo "kubectl : $(kubectl version --client)"
+
+      - name: 初始化 Job Summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## zlm-deploy-test / k8s-amd64（kind 单节点）"
+            echo ""
+            echo "- 镜像：\`$IMAGE:$VERSION\`"
+            echo "- kind：\`$(kind version | awk '{print $2}')\`"
+            echo ""
+            echo "| # | 断言 | 结果 |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 登录 GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
 
       - name: 拉取镜像并校验架构（仅 amd64）
         run: |
+          set -euo pipefail
           docker pull "$IMAGE:$VERSION"
           arch=$(docker image inspect "$IMAGE:$VERSION" --format '{{.Architecture}}')
           echo "镜像架构: $arch"
           [ "$arch" = "amd64" ] || { echo "!! 期望 amd64，实际 $arch"; exit 1; }
 
-      - name: 安装 kubectl / kind
-        run: |
-          set -e
-          # 版本号均动态解析自官方源，不硬编码：
-          #  - kubectl: k8s 官方 stable 指针
-          #  - kind:     GitHub 官方 latest release 资产
-          KUBECTL_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
-          echo "kubectl version: $KUBECTL_VERSION"
-          curl -sLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
-          kubectl version --client
-
-          KIND_VERSION=$(curl -s "https://api.github.com/repos/kubernetes-sigs/kind/releases/latest" \
-            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
-          echo "kind version: $KIND_VERSION"
-          curl -sLo kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
-          chmod +x kind && sudo mv kind /usr/local/bin/kind
-          kind version
-
       - name: 创建 kind 单节点集群（映射 80/1935/554 到 runner 本机）
         run: |
-          set -e
-          cat > "$RUNNER_TEMP/kind-config.yaml" <<EOF
-          kind: Cluster
-          apiVersion: kind.x-k8s.io/v1alpha4
-          nodes:
-            - role: control-plane
-              extraPortMappings:
-                - { containerPort: 80,   hostPort: ${PORT_HTTP}, protocol: TCP }
-                - { containerPort: 1935, hostPort: ${PORT_RTMP}, protocol: TCP }
-                - { containerPort: 554,  hostPort: ${PORT_RTSP}, protocol: TCP }
-          EOF
-          cat "$RUNNER_TEMP/kind-config.yaml"
-          kind create cluster --name "$CLUSTER" --config "$RUNNER_TEMP/kind-config.yaml" --wait 180s
+          set -euo pipefail
+          # 集群拓扑声明式入库（.github/kind-config.yaml），不再由流水线内联生成
+          kind create cluster --name "$CLUSTER" --config .github/kind-config.yaml --wait 180s
           kubectl cluster-info --context "kind-$CLUSTER"
           kubectl get nodes -o wide
 
       - name: 灌入被测镜像到集群节点
         run: |
+          set -euo pipefail
           kind load docker-image "$IMAGE:$VERSION" --name "$CLUSTER"
           # 校验被测镜像已进入节点 containerd，避免 Pod 走远端拉取而掩盖加载问题
           docker exec "$CLUSTER-control-plane" sh -c \
@@ -184,7 +229,7 @@ jobs:
 
       - name: 渲染 manifests（绑定本次测试版本，避免默认 latest）
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/manifests"
           cp deploy/k8s/*.yaml "$RUNNER_TEMP/manifests/"
           # deployment.yaml 默认写的是 :latest，替换为本次测试的 $IMAGE:$VERSION
@@ -194,7 +239,7 @@ jobs:
 
       - name: 预检 manifests（server dry-run，由 API Server 严格校验字段，不落库）
         run: |
-          set -e
+          set -euo pipefail
           # 命名空间需先真实创建，后续对象才能做服务端校验
           kubectl apply -f "$RUNNER_TEMP/manifests/namespace.yaml"
           for f in configmap.yaml secret.yaml service.yaml deployment.yaml; do
@@ -204,7 +249,7 @@ jobs:
 
       - name: 应用 manifests（ns -> configmap -> secret -> svc -> deployment）
         run: |
-          set -e
+          set -euo pipefail
           for f in namespace.yaml configmap.yaml secret.yaml service.yaml deployment.yaml; do
             echo "==> apply $f"
             kubectl apply -f "$RUNNER_TEMP/manifests/$f"
@@ -213,19 +258,20 @@ jobs:
 
       - name: 等待 rollout 完成（Deployment Available）
         run: |
-          set -e
+          set -euo pipefail
           kubectl -n "$NS" rollout status "deploy/zlmediakit" --timeout=300s
           kubectl -n "$NS" wait --for=condition=Available "deploy/zlmediakit" --timeout=300s
           kubectl -n "$NS" get pods -l app=zlmediakit -o wide
 
       - name: 断言 1/5 - 配置 secret 合法（非上游默认）且容器内未被改写
         run: |
-          set -e
+          set -euo pipefail
           # 背景：ZLMediaKit 启动时若发现 api.secret 为上游默认值或为空，会拒绝使用并
           # 随机生成新 secret 写回配置文件(server/main.cpp:300)。ConfigMap 只读写不回去，
           # 于是运行实例持有的是无人知晓的随机 secret，任何来源的 API 调用都会返回
           # code=-100 "Please login first"（run 36556076125/36557347879 实测）。
-          SECRET=$(sed -n 's/^[[:space:]]*secret=//p' deploy/k8s/configmap.yaml | head -1 | tr -d '\r')
+          # 用 grep -m1 而非 `sed | head -1`：在 pipefail 下 head 提前退出会给上游 SIGPIPE，导致整行失败
+          SECRET=$(grep -m1 -E '^[[:space:]]*secret=' deploy/k8s/configmap.yaml | tr -d '\r' | cut -d= -f2-)
           echo "配置 secret: ${SECRET}"
           [ -n "$SECRET" ] || { echo "!! 未取到 secret"; exit 1; }
           [ "$SECRET" != "$DEFAULT_SECRET" ] || { echo "!! 使用了上游默认 secret"; exit 1; }
@@ -233,10 +279,11 @@ jobs:
             bash -c "sed -n 's/^secret=//p' /opt/media/conf/config.ini | head -1 | tr -d '\r'")
           echo "容器内 secret: ${cur}"
           [ "$cur" = "$SECRET" ] || { echo "!! 容器内 secret 与 ConfigMap 不一致"; exit 1; }
+          echo "| 1 | 编排 secret 合法（非默认）且容器内未被改写 | ✅ |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 断言 2/5 - Pod 使用指定版本镜像、Ready 且未重启
         run: |
-          set -e
+          set -euo pipefail
           img=$(kubectl -n "$NS" get pod -l app=zlmediakit -o jsonpath='{.items[0].spec.containers[0].image}')
           echo "pod image: $img"
           [ "$img" = "$IMAGE:$VERSION" ] || { echo "!! 镜像不符，期望 $IMAGE:$VERSION"; exit 1; }
@@ -249,20 +296,23 @@ jobs:
           [ "$ready" = "True" ]    || { echo "!! Pod 未 Ready"; exit 1; }
           # 若 liveness/就绪配置不当导致反复重启，restartCount 会增长
           [ "$restarts" = "0" ]    || { echo "!! Pod 发生重启($restarts)"; exit 1; }
+          echo "| 2 | Pod 镜像版本绑定、Running/Ready、restartCount=0 | ✅ |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 断言 3/5 - ConfigMap / Secret 挂载生效
         run: |
-          set -e
+          set -euo pipefail
           # Secret 经 subPath 挂到 /opt/media/bin/default.pem；ConfigMap 挂到 /opt/media/conf
           kubectl -n "$NS" exec deploy/zlmediakit -- \
             bash -c 'test -s /opt/media/bin/default.pem && test -s /opt/media/conf/config.ini \
                      && echo "MOUNTS_OK" && ls -l /opt/media/bin/default.pem /opt/media/conf/config.ini'
+          echo "| 3 | ConfigMap(config.ini) 与 Secret(default.pem, subPath) 挂载生效 | ✅ |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 断言 4/5 - hostNetwork 端口经节点对外可达（HTTP API + 1935/554 监听）
         run: |
-          set -e
+          set -euo pipefail
           # 从 k8s 自己的 ConfigMap 取 secret（缩进 4 空格），CRLF 会污染 URL 必须 strip CR
-          SECRET=$(sed -n 's/^[[:space:]]*secret=//p' deploy/k8s/configmap.yaml | head -1 | tr -d '\r')
+          # 用 grep -m1 而非 `sed | head -1`：在 pipefail 下 head 提前退出会给上游 SIGPIPE，导致整行失败
+          SECRET=$(grep -m1 -E '^[[:space:]]*secret=' deploy/k8s/configmap.yaml | tr -d '\r' | cut -d= -f2-)
           echo "secret: ${SECRET}"
           [ -n "$SECRET" ] || { echo "!! 未能从 configmap.yaml 取到 secret"; exit 1; }
           echo "==> HTTP API getServerConfig (hostNetwork -> node -> runner:$PORT_HTTP)"
@@ -279,10 +329,11 @@ jobs:
             (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null || { echo "!! 端口 $p 未监听"; exit 1; }
             echo "端口 $p OK"
           done
+          echo "| 4 | hostNetwork 端口可达（API code=0、1935/554 监听） | ✅ |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 断言 5/5 - ClusterIP Service 连通（endpoints 就绪 + Pod 内 HTTP 访问）
         run: |
-          set -e
+          set -euo pipefail
           kubectl -n "$NS" get endpoints zlmediakit -o yaml
           eps=$(kubectl -n "$NS" get endpoints zlmediakit -o jsonpath='{.subsets[0].addresses[0].ip}')
           [ -n "$eps" ] || { echo "!! Service 无可用 endpoints"; exit 1; }
@@ -294,7 +345,8 @@ jobs:
 
           # /index/api/version 含 CHECK_SECRET（仅源 IP 为 127.0.0.1 时免密）；
           # Pod 经 ClusterIP 访问的源 IP 是节点 IP，必须带上 secret
-          SECRET=$(sed -n 's/^[[:space:]]*secret=//p' deploy/k8s/configmap.yaml | head -1 | tr -d '\r')
+          # 用 grep -m1 而非 `sed | head -1`：在 pipefail 下 head 提前退出会给上游 SIGPIPE，导致整行失败
+          SECRET=$(grep -m1 -E '^[[:space:]]*secret=' deploy/k8s/configmap.yaml | tr -d '\r' | cut -d= -f2-)
           # 必须显式要求 Connection: close 并读满到 EOF：HTTP 头本身就有约 400 字节，
           # 只读前 400 字节会把 JSON body 截断在外，grep 不到 "code" 而误判（run 36558742514 实测）
           resp=$(kubectl -n "$NS" exec deploy/zlmediakit -- \
@@ -302,9 +354,13 @@ jobs:
                      printf 'GET /index/api/version?secret=${SECRET} HTTP/1.0\r\nConnection: close\r\n\r\n' >&3; \
                      timeout 20 head -c 2000 <&3")
           echo "HTTP 响应: $resp"
-          echo "$resp" | head -n 1 | grep -q "200" || { echo "!! ClusterIP Service 未返回 200"; exit 1; }
+          # 同样避开 `| head -n 1`：改用 sed -n '1p' 读完整个输入，再单独判定
+          status_line=$(printf '%s\n' "$resp" | sed -n '1p')
+          echo "状态行: $status_line"
+          echo "$status_line" | grep -q "200" || { echo "!! ClusterIP Service 未返回 200"; exit 1; }
           echo "$resp" | grep -Eq '"code"[[:space:]]*:[[:space:]]*0' \
             || { echo "!! ClusterIP Service 响应业务 code != 0"; exit 1; }
+          echo "| 5 | ClusterIP Service endpoints 就绪且 Pod 内 HTTP code=0 | ✅ |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 失败诊断输出
         if: failure()
@@ -313,6 +369,26 @@ jobs:
           kubectl -n "$NS" describe deploy/zlmediakit || true
           kubectl -n "$NS" describe pod -l app=zlmediakit || true
           kubectl -n "$NS" logs -l app=zlmediakit --tail 300 || true
+
+      - name: 导出集群诊断日志（kind export logs）
+        if: failure()
+        run: |
+          set -uo pipefail
+          mkdir -p /tmp/zlm-diag
+          kubectl -n "$NS" describe deploy/zlmediakit            > /tmp/zlm-diag/deploy-describe.txt || true
+          kubectl -n "$NS" describe pod -l app=zlmediakit        > /tmp/zlm-diag/pod-describe.txt || true
+          kubectl -n "$NS" logs -l app=zlmediakit --tail 2000    > /tmp/zlm-diag/pod-logs.txt || true
+          kubectl -n "$NS" get events --sort-by=.metadata.creationTimestamp > /tmp/zlm-diag/events.txt || true
+          # kind 官方诊断命令：导出集群各节点的 kubelet/containerd/kubeadm 日志
+          kind export logs --name "$CLUSTER" /tmp/zlm-diag/kind-logs || true
+
+      - name: 上传诊断工件
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zlm-k8s-deploy-test-diag
+          path: /tmp/zlm-diag
+          retention-days: 7
 
       - name: 清理（kind 集群）
         if: always()
