@@ -69,7 +69,9 @@ jobs:
             --data-urlencode "secret=${SECRET}" "http://127.0.0.1/index/api/getServerConfig")
           head -c 300 /tmp/api.json; echo
           [ "$code" = "200" ] || { echo "!! API HTTP $code"; exit 1; }
-          grep -q '"code":0' /tmp/api.json || { echo "!! API 业务 code != 0"; exit 1; }
+          # 返回的 JSON 为 "code" : 0（冒号两侧有空格），故用 python 严格解析而非字符串匹配
+          python3 -c 'import json,sys; d=json.load(open("/tmp/api.json")); sys.exit(0 if d.get("code")==0 else 1)' \
+            || { echo "!! API 业务 code != 0"; exit 1; }
           echo "==> 端口监听检查（1935/554）"
           for p in 1935 554; do
             (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null || { echo "!! 端口 $p 未监听"; exit 1; }
