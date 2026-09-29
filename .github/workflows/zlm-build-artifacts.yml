@@ -1,0 +1,99 @@
+name: zlm-build-artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不要加 v 前缀，例如 1.0.0）'
+        required: true
+        default: '1.0.0'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout（不含子模块）
+        uses: actions/checkout@v4
+
+      - name: 子模块改用 GitHub 镜像（规避 gitee 不稳）
+        run: |
+          # 直接改写本地 .gitmodules 为 GitHub 镜像，再 sync。
+          # 注意：git submodule sync 会把 .git/config 的 url 回退成 .gitmodules 的值，
+          # 因此必须先改 .gitmodules（仅 runner 本地，不提交），再 sync，才能确保走 GitHub。
+          sed -i \
+            -e 's#https://gitee.com/xia-chu/ZLToolKit#https://github.com/ZLMediaKit/ZLToolKit#g' \
+            -e 's#https://gitee.com/ireader/media-server#https://github.com/ireader/media-server#g' \
+            -e 's#https://gitee.com/mirrors/jsoncpp.git#https://github.com/open-source-parsers/jsoncpp.git#g' \
+            -e 's#https://gitee.com/victor1002/zlm_webassist#https://github.com/1002victor/zlm_webassist#g' \
+            -e 's#https://gitee.com/mirrors/pybind11.git#https://github.com/pybind/pybind11.git#g' \
+            .gitmodules
+          echo "==> .gitmodules 改写后:" && cat .gitmodules
+          git submodule sync
+          # 重试，避免瞬时网络抖动
+          for i in 1 2 3; do
+            git submodule update --init --recursive && break
+            echo "submodule update 第 $i 次失败，重试..."
+            sleep 5
+          done
+
+      - name: 安装编译依赖（最新兼容版）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git pkg-config \
+            libssl-dev libsrtp2-dev
+          # usrsctp 可选：提供则开启 datachannel，缺失则自动关闭（不报错）
+          sudo apt-get install -y --no-install-recommends libusrsctp-dev || \
+            echo "libusrsctp-dev 不可用，SCTP/datachannel 将被自动关闭"
+
+      - name: 编译并打包
+        env:
+          SRC: ${{ github.workspace }}
+          OUT: ${{ github.workspace }}/output
+          VERSION: ${{ github.event.inputs.version }}
+        run: bash building/build.sh ${{ matrix.arch }} "$VERSION"
+
+      - name: 上传制品（Actions Artifact，保留 90 天）
+        uses: actions/upload-artifact@v4
+        with:
+          name: zlm-${{ matrix.arch }}
+          path: ${{ github.workspace }}/output/*.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    name: create-release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: 下载全部架构制品
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 创建 GitHub Release 并附加制品
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          ls -lh artifacts
+          gh release create "$VERSION" \
+            --repo "${{ github.repository }}" \
+            --title "ZLMediaKit $VERSION" \
+            --notes "ZLMediaKit $VERSION 跨平台制品（amd64 / arm64）" \
+            artifacts/*.tar.gz

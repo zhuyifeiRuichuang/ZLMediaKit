@@ -1,0 +1,53 @@
+# ZLMediaKit 运行时镜像（最精简）
+#
+# 设计: 从「预编译制品」装配，而非在镜像内编译。
+#  - 编译在 GitHub Actions 原生 amd64/arm64 runner 完成（见 building/build.sh）
+#  - 本 Dockerfile 仅负责把对应架构的制品放入最小基础镜像
+#  - 通过 --build-arg ARCH=amd64|arm64 选择制品目录；逐架构构建后由
+#    `docker buildx imagetools create` 合并为多架构清单
+#
+# 基础镜像: debian:13-slim（glibc，兼容性最佳，约 27MB）
+#   如需最小体积可改用 alpine:3.24（musl），但部分原生库需注意兼容
+ARG BASE_IMAGE=debian:13-slim
+FROM ${BASE_IMAGE}
+
+ARG ARCH
+ENV TZ=Asia/Shanghai \
+    LANG=C.UTF-8
+
+# 运行时依赖（与编译期动态链接对应）:
+#   libssl3       OpenSSL 3 运行时（WebRTC/HTTPS/RTSPS 需要）
+#   libsrtp2-1    SRTP 运行时（WebRTC 需要）
+#   libusrsctp1   SCTP/datachannel 运行时（启用时）
+#   libstdc++6/libgcc-s1/libatomic1  C++/atomics 运行时（arm64 常见）
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates tzdata \
+      libssl3 libsrtp2-1 libusrsctp1 \
+      libstdc++6 libgcc-s1 libatomic1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
+ && echo ${TZ} > /etc/timezone
+
+WORKDIR /opt/media/bin
+
+# 复制对应架构的制品（由 build 上下文中的 <ARCH>/ 目录提供）
+COPY ${ARCH}/bin/MediaServer /opt/media/bin/MediaServer
+COPY ${ARCH}/bin/default.pem /opt/media/bin/default.pem
+COPY ${ARCH}/bin/www/        /opt/media/bin/www/
+COPY ${ARCH}/conf/config.ini /opt/media/conf/config.ini
+
+RUN chmod +x /opt/media/bin/MediaServer
+
+# 标准端口（与 conf/config.ini 默认一致）:
+#   RTMP 1935 / RTSP 554 / HTTP 80 / HTTPS 443
+#   RTP_PROXY 10000 / RTC 8000 / 9000（TCP+UDP）
+EXPOSE 1935/tcp 554/tcp 80/tcp 443/tcp 10000/tcp 8000/tcp 9000/tcp
+EXPOSE 10000/udp 8000/udp 9000/udp
+
+# 健康检查: 探测 HTTP(80) 端口是否就绪（bash 内置 /dev/tcp，无需额外工具）
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/80' || exit 1
+
+# 工作目录即二进制所在目录，故相对路径 default.pem / ../conf/config.ini 生效
+ENTRYPOINT ["./MediaServer", "-s", "default.pem", "-c", "../conf/config.ini", "-l", "0"]
