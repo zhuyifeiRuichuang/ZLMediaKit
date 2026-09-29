@@ -10,7 +10,7 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - ./config:/opt/media/conf
-      - ./cert:/opt/media/bin
+      - ./cert/default.pem:/opt/media/bin/default.pem
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/80"]
       interval: 30s
