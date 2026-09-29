@@ -28,13 +28,13 @@ ENV TZ=Asia/Shanghai \
 #   python3          内嵌 Python 解释器运行时（libpython3.12）
 #   libssl3          OpenSSL 3 运行时（WebRTC/HTTPS/RTSPS）
 #   libsrtp2-1       SRTP 运行时（WebRTC）
-#   libusrsctp1      SCTP/datachannel 运行时（启用时）
+#   libusrsctp2      SCTP/datachannel 运行时（启用时）
 #   libstdc++6/libgcc-s1/libatomic1  C++/atomics 运行时（arm64 常见）
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates tzdata \
       ffmpeg libmysqlclient21 python3 \
-      libssl3 libsrtp2-1 libusrsctp1 \
+      libssl3 libsrtp2-1 libusrsctp2 \
       libstdc++6 libgcc-s1 libatomic1 \
  && rm -rf /var/lib/apt/lists/* \
  && ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
