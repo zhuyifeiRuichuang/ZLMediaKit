@@ -38,6 +38,10 @@ jobs:
         working-directory: deploy
         run: |
           cp .env.example .env
+          # 绑定到本次测试指定的版本/镜像，避免 .env.example 默认 latest 覆盖入参
+          sed -i "s|^ZLM_VERSION=.*|ZLM_VERSION=${VERSION}|" .env
+          sed -i "s|^ZLM_IMAGE=.*|ZLM_IMAGE=${IMAGE}|" .env
+          cat .env
           docker compose up -d
           docker compose ps
 
@@ -58,9 +62,11 @@ jobs:
 
       - name: 冒烟测试（HTTP API + 端口监听）
         run: |
-          SECRET=$(grep -E '^secret=' deploy/config/config.ini | cut -d= -f2)
+          # config.ini 为 CRLF 行结尾，必须 strip CR，否则 URL 内含 \r 导致 curl exit 3 (URL malformed)
+          SECRET=$(grep -m1 -E '^secret=' deploy/config/config.ini | tr -d '\r' | cut -d= -f2)
           echo "==> HTTP API getServerConfig"
-          code=$(curl -s -o /tmp/api.json -w '%{http_code}' "http://127.0.0.1/index/api/getServerConfig?secret=${SECRET}")
+          code=$(curl -s -o /tmp/api.json -w '%{http_code}' --get \
+            --data-urlencode "secret=${SECRET}" "http://127.0.0.1/index/api/getServerConfig")
           head -c 300 /tmp/api.json; echo
           [ "$code" = "200" ] || { echo "!! API HTTP $code"; exit 1; }
           grep -q '"code":0' /tmp/api.json || { echo "!! API 业务 code != 0"; exit 1; }
