@@ -6,23 +6,34 @@
 #  - 通过 --build-arg ARCH=amd64|arm64 选择制品目录；逐架构构建后由
 #    `docker buildx imagetools create` 合并为多架构清单
 #
-# 基础镜像: debian:13-slim（glibc，兼容性最佳，约 27MB）
-#   如需最小体积可改用 alpine:3.24（musl），但部分原生库需注意兼容
-ARG BASE_IMAGE=debian:13-slim
+# 基础镜像: ubuntu:24.04（glibc，与编译 runner 同发行版，保证 SONAME 一致）
+#   说明: 编译在 ubuntu-24.04 runner 完成，二进制动态链接 ubuntu 的
+#         libav*(FFMPEG) / libmysqlclient(MySQL) / libpython(Python)。
+#         若改用 debian:13-slim 等其它发行版，这些库的 SONAME 版本不一致，
+#         会导致容器启动报 "error while loading shared libraries"。
+#         因此完整功能（含 FFMPEG/MYSQL/PYTHON）镜像必须使用 ubuntu:24.04。
+#   体积: 接受更大镜像（用户已确认）。如需最小体积，请仅启用 API/WEBRTC/SRT/SCTP
+#         等不依赖发行版多媒体库的组件，并改用 debian:13-slim。
+ARG BASE_IMAGE=ubuntu:24.04
 FROM ${BASE_IMAGE}
 
 ARG ARCH
 ENV TZ=Asia/Shanghai \
-    LANG=C.UTF-8
+    LANG=C.UTF-8 \
+    PYTHONPATH=/opt/media/bin/python
 
-# 运行时依赖（与编译期动态链接对应）:
-#   libssl3       OpenSSL 3 运行时（WebRTC/HTTPS/RTSPS 需要）
-#   libsrtp2-1    SRTP 运行时（WebRTC 需要）
-#   libusrsctp1   SCTP/datachannel 运行时（启用时）
+# 运行时依赖（与编译期动态链接一一对应）:
+#   ffmpeg           提供 libavcodec/libavformat/libavutil/libswscale/libswresample/libavfilter 运行时
+#   libmysqlclient21  MySQL 客户端钩子运行时（libmysqlclient.so.21）
+#   python3          内嵌 Python 解释器运行时（libpython3.12）
+#   libssl3          OpenSSL 3 运行时（WebRTC/HTTPS/RTSPS）
+#   libsrtp2-1       SRTP 运行时（WebRTC）
+#   libusrsctp1      SCTP/datachannel 运行时（启用时）
 #   libstdc++6/libgcc-s1/libatomic1  C++/atomics 运行时（arm64 常见）
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates tzdata \
+      ffmpeg libmysqlclient21 python3 \
       libssl3 libsrtp2-1 libusrsctp1 \
       libstdc++6 libgcc-s1 libatomic1 \
  && rm -rf /var/lib/apt/lists/* \

@@ -8,9 +8,9 @@ on:
         required: true
         default: '1.0.0'
       base_image:
-        description: '运行时基础镜像（兼容性范围内最新最精简）'
+        description: '运行时基础镜像（完整功能须用 ubuntu:24.04 以匹配编译期 SONAME）'
         required: true
-        default: 'debian:13-slim'
+        default: 'ubuntu:24.04'
 
 permissions:
   contents: read
