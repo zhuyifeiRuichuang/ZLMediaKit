@@ -73,7 +73,27 @@ kubectl -n zlmediakit logs -f deploy/zlmediakit
 | 30000-35000 | UDP | RTP/RTCP 动态范围 |
 | 49152-65535 | UDP | RTC 动态范围 |
 
-## 四、部署测试建议
+## 四、CI 自动化部署测试
+
+流水线 `.github/workflows/zlm-deploy-test.yml`（手动触发，输入镜像 tag）包含两个并行 job，**均仅测 amd64**（arm64 由真机/节点侧验证）：
+
+| Job | 场景 | 环境 | 断言内容 |
+| --- | --- | --- | --- |
+| `deploy-test-compose-amd64` | docker compose | runner 原生 docker | 镜像架构=amd64、容器 healthy、`getServerConfig` code=0、1935/554 监听 |
+| `deploy-test-k8s-amd64` | Kubernetes | 单节点 kind 集群（`kind created cluster` + extraPortMappings） | 见下 |
+
+k8s job 覆盖点：
+
+1. **镜像版本绑定**：`sed` 把 `deployment.yaml` 的 `:latest` 替换为本次测试 `$IMAGE:$VERSION`，校验 Pod 实际使用镜像一致。
+2. **编排对象就绪**：按顺序 apply `namespace → configmap → secret → service → deployment`，`kubectl rollout status` + `Available` 条件等待通过。
+3. **运行态健康**：Pod phase=Running、Ready=True、`restartCount=0`（探针配置合理，未发生反复重启）。
+4. **挂载生效**：`ConfigMap(config.ini)` 与 `Secret(default.pem, subPath)` 在容器内均存在且非空。
+5. **hostNetwork 暴露**：集群端口经 kind `extraPortMappings`（80→30080、1935→31935、554→30554）在 runner 本机可访问；`getServerConfig` 返回 code=0，1935/554 可连通。
+6. **Service 转发**：`endpoints` 有可用地址，Pod 内经 ClusterIP:80 发起 HTTP 请求返回 200。
+
+> 流水线使用的 kubectl / kind 版本动态取自官方源（kubectl 取 `dl.k8s.io/release/stable.txt`，kind 取 GitHub `latest` release），不硬编码版本号。
+
+## 五、部署测试建议
 
 1. **冒烟**：部署后 `curl -sI http://<节点IP>/` 应返回 200（HTTP 服务/Web 页面）。
 2. **推流**：用 RTMP 推流 `rtmp://<节点IP>/live/stream`，再用 VLC/Web 播放器拉流验证。

@@ -13,8 +13,11 @@ permissions:
   packages: read
 
 jobs:
-  deploy-test:
-    name: deploy-test-amd64
+  # Job 1: docker compose 部署测试（amd64）
+  # Job 2: k8s（kind）部署测试（amd64）
+  # 两者并行，一次手动触发即完成全环境部署验证
+  deploy-test-compose:
+    name: deploy-test-compose-amd64
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -79,7 +82,189 @@ jobs:
           done
           echo "==> 部署测试全部通过"
 
-      - name: 清理
+      - name: 清理（compose）
         if: always()
         working-directory: deploy
         run: docker compose down -v
+
+  # ------------------------------------------------------------------
+  # k8s 部署测试（amd64 单节点 kind 集群）
+  # 覆盖点（超出 compose 的部分）：
+  #   - Namespace / ConfigMap(config.ini) / Secret(default.pem, subPath) 挂载是否生效
+  #   - Deployment rollout + readiness/liveness 探针 -> Pod Ready 且未重启
+  #   - hostNetwork 端口暴露：经 kind extraPortMappings 在 runner 本机可访问 80/1935/554
+  #   - ClusterIP Service 连通性（含 endpoints 就绪）
+  # ------------------------------------------------------------------
+  deploy-test-k8s:
+    name: deploy-test-k8s-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ github.event.inputs.version }}
+      IMAGE: ghcr.io/zhuyifeiruichuang/zlmediakit
+      NS: zlmediakit
+      CLUSTER: zlm-ci
+      # hostNetwork 端口 -> runner 本机端口的映射（kind extraPortMappings）
+      PORT_HTTP: 30080
+      PORT_RTMP: 31935
+      PORT_RTSP: 30554
+    steps:
+      - name: Checkout（取 deploy/k8s 编排文件）
+        uses: actions/checkout@v4
+
+      - name: 登录 GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: 拉取镜像并校验架构（仅 amd64）
+        run: |
+          docker pull "$IMAGE:$VERSION"
+          arch=$(docker image inspect "$IMAGE:$VERSION" --format '{{.Architecture}}')
+          echo "镜像架构: $arch"
+          [ "$arch" = "amd64" ] || { echo "!! 期望 amd64，实际 $arch"; exit 1; }
+
+      - name: 安装 kubectl / kind
+        run: |
+          set -e
+          # 版本号均动态解析自官方源，不硬编码：
+          #  - kubectl: k8s 官方 stable 指针
+          #  - kind:     GitHub 官方 latest release 资产
+          KUBECTL_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+          echo "kubectl version: $KUBECTL_VERSION"
+          curl -sLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+          KIND_VERSION=$(curl -s "https://api.github.com/repos/kubernetes-sigs/kind/releases/latest" \
+            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+          echo "kind version: $KIND_VERSION"
+          curl -sLo kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x kind && sudo mv kind /usr/local/bin/kind
+          kind version
+
+      - name: 创建 kind 单节点集群（映射 80/1935/554 到 runner 本机）
+        run: |
+          set -e
+          cat > "$RUNNER_TEMP/kind-config.yaml" <<EOF
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              extraPortMappings:
+                - { containerPort: 80,   hostPort: ${PORT_HTTP}, protocol: TCP }
+                - { containerPort: 1935, hostPort: ${PORT_RTMP}, protocol: TCP }
+                - { containerPort: 554,  hostPort: ${PORT_RTSP}, protocol: TCP }
+          EOF
+          cat "$RUNNER_TEMP/kind-config.yaml"
+          kind create cluster --name "$CLUSTER" --config "$RUNNER_TEMP/kind-config.yaml" --wait 180s
+          kubectl cluster-info --context "kind-$CLUSTER"
+          kubectl get nodes -o wide
+
+      - name: 灌入被测镜像到集群节点
+        run: |
+          kind load docker-image "$IMAGE:$VERSION" --name "$CLUSTER"
+          # 校验被测镜像已进入节点 containerd，避免 Pod 走远端拉取而掩盖加载问题
+          docker exec "$CLUSTER-control-plane" sh -c \
+            'crictl images 2>/dev/null || ctr --namespace k8s.io images list' \
+            | grep -F "$IMAGE" || { echo "!! 镜像未出现在节点 containerd 中"; exit 1; }
+
+      - name: 渲染 manifests（绑定本次测试版本，避免默认 latest）
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/manifests"
+          cp deploy/k8s/*.yaml "$RUNNER_TEMP/manifests/"
+          # deployment.yaml 默认写的是 :latest，替换为本次测试的 $IMAGE:$VERSION
+          sed -i -E "s#(image:[[:space:]]+).*zlmediakit:.*#\1${IMAGE}:${VERSION}#" \
+            "$RUNNER_TEMP/manifests/deployment.yaml"
+          grep -n 'image:' "$RUNNER_TEMP/manifests/deployment.yaml"
+
+      - name: 应用 manifests（ns -> configmap -> secret -> svc -> deployment）
+        run: |
+          set -e
+          for f in namespace.yaml configmap.yaml secret.yaml service.yaml deployment.yaml; do
+            echo "==> apply $f"
+            kubectl apply -f "$RUNNER_TEMP/manifests/$f"
+          done
+          kubectl -n "$NS" get cm,secret,svc,deploy
+
+      - name: 等待 rollout 完成（Deployment Available）
+        run: |
+          set -e
+          kubectl -n "$NS" rollout status "deploy/zlmediakit" --timeout=300s
+          kubectl -n "$NS" wait --for=condition=Available "deploy/zlmediakit" --timeout=300s
+          kubectl -n "$NS" get pods -l app=zlmediakit -o wide
+
+      - name: 断言 1/4 - Pod 使用指定版本镜像、Ready 且未重启
+        run: |
+          set -e
+          img=$(kubectl -n "$NS" get pod -l app=zlmediakit -o jsonpath='{.items[0].spec.containers[0].image}')
+          echo "pod image: $img"
+          [ "$img" = "$IMAGE:$VERSION" ] || { echo "!! 镜像不符，期望 $IMAGE:$VERSION"; exit 1; }
+
+          phase=$(kubectl -n "$NS" get pod -l app=zlmediakit -o jsonpath='{.items[0].status.phase}')
+          ready=$(kubectl -n "$NS" get pod -l app=zlmediakit -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}')
+          restarts=$(kubectl -n "$NS" get pod -l app=zlmediakit -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')
+          echo "phase=$phase ready=$ready restarts=$restarts"
+          [ "$phase" = "Running" ] || { echo "!! Pod 未 Running"; exit 1; }
+          [ "$ready" = "True" ]    || { echo "!! Pod 未 Ready"; exit 1; }
+          # 若 liveness/就绪配置不当导致反复重启，restartCount 会增长
+          [ "$restarts" = "0" ]    || { echo "!! Pod 发生重启($restarts)"; exit 1; }
+
+      - name: 断言 2/4 - ConfigMap / Secret 挂载生效
+        run: |
+          set -e
+          # Secret 经 subPath 挂到 /opt/media/bin/default.pem；ConfigMap 挂到 /opt/media/conf
+          kubectl -n "$NS" exec deploy/zlmediakit -- \
+            bash -c 'test -s /opt/media/bin/default.pem && test -s /opt/media/conf/config.ini \
+                     && echo "MOUNTS_OK" && ls -l /opt/media/bin/default.pem /opt/media/conf/config.ini'
+
+      - name: 断言 3/4 - hostNetwork 端口经节点对外可达（HTTP API + 1935/554 监听）
+        run: |
+          set -e
+          # 从 k8s 自己的 ConfigMap 取 secret（缩进 4 空格），CRLF 会污染 URL 必须 strip CR
+          SECRET=$(sed -n 's/^[[:space:]]*secret=//p' deploy/k8s/configmap.yaml | head -1 | tr -d '\r')
+          echo "secret: ${SECRET}"
+          [ -n "$SECRET" ] || { echo "!! 未能从 configmap.yaml 取到 secret"; exit 1; }
+          echo "==> HTTP API getServerConfig (hostNetwork -> node -> runner:$PORT_HTTP)"
+          code=$(curl -s -o /tmp/api.json -w '%{http_code}' --get \
+            --data-urlencode "secret=${SECRET}" "http://127.0.0.1:${PORT_HTTP}/index/api/getServerConfig")
+          head -c 300 /tmp/api.json; echo
+          [ "$code" = "200" ] || { echo "!! API HTTP $code"; exit 1; }
+          # 返回的 JSON 为 "code" : 0（冒号两侧可能有空格），故用 python 严格解析而非字符串匹配
+          python3 -c 'import json,sys; d=json.load(open("/tmp/api.json")); sys.exit(0 if d.get("code")==0 else 1)' \
+            || { echo "!! API 业务 code != 0"; exit 1; }
+
+          echo "==> 端口监听检查（RTMP $PORT_RTMP / RTSP $PORT_RTSP）"
+          for p in "$PORT_RTMP" "$PORT_RTSP"; do
+            (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null || { echo "!! 端口 $p 未监听"; exit 1; }
+            echo "端口 $p OK"
+          done
+
+      - name: 断言 4/4 - ClusterIP Service 连通（endpoints 就绪 + Pod 内 HTTP 访问）
+        run: |
+          set -e
+          kubectl -n "$NS" get endpoints zlmediakit -o yaml
+          eps=$(kubectl -n "$NS" get endpoints zlmediakit -o jsonpath='{.subsets[0].addresses[0].ip}')
+          [ -n "$eps" ] || { echo "!! Service 无可用 endpoints"; exit 1; }
+          echo "endpoint ip: $eps"
+
+          CLUSTER_IP=$(kubectl -n "$NS" get svc zlmediakit -o jsonpath='{.spec.clusterIP}')
+          echo "clusterIP: $CLUSTER_IP"
+          [ -n "$CLUSTER_IP" ] || { echo "!! Service 无 ClusterIP"; exit 1; }
+
+          # 镜像内无 curl，用 bash 内置 /dev/tcp 完成一次真实 HTTP 请求，验证 Service 转发链路
+          resp=$(kubectl -n "$NS" exec deploy/zlmediakit -- \
+            bash -c "exec 3<>/dev/tcp/${CLUSTER_IP}/80; printf 'GET /index/api/version HTTP/1.0\r\n\r\n' >&3; head -n 1 <&3")
+          echo "HTTP 响应首行: $resp"
+          echo "$resp" | grep -q "200" || { echo "!! ClusterIP Service 未返回 200"; exit 1; }
+
+      - name: 失败诊断输出
+        if: failure()
+        run: |
+          kubectl -n "$NS" get all -o wide || true
+          kubectl -n "$NS" describe deploy/zlmediakit || true
+          kubectl -n "$NS" describe pod -l app=zlmediakit || true
+          kubectl -n "$NS" logs -l app=zlmediakit --tail 300 || true
+
+      - name: 清理（kind 集群）
+        if: always()
+        run: kind delete cluster --name "$CLUSTER"
