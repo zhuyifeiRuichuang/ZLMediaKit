@@ -1,6 +1,8 @@
 name: Linux_ARM64
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+
 
 jobs:
   build:

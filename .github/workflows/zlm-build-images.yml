@@ -22,10 +22,14 @@ jobs:
     env:
       VERSION: ${{ github.event.inputs.version }}
       BASE_IMAGE: ${{ github.event.inputs.base_image }}
-      IMAGE: ghcr.io/${{ github.repository_owner }}/zlmediakit
     steps:
       - name: Checkout（仅取构建文件，无需子模块）
         uses: actions/checkout@v4
+
+      - name: 计算镜像名（GHCR 要求全小写）
+        run: |
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE=ghcr.io/${OWNER_LC}/zlmediakit" >> "$GITHUB_ENV"
 
       - name: 从 GitHub Release 下载 mediaserver 双架构制品
         env:

@@ -1,11 +1,7 @@
 name: Docker
 
 on:
-  push:
-    branches:
-      - "master"
-      - "feature/*"
-      - "release/*"
+  workflow_dispatch:
 
 env:
   # Use docker.io for Docker Hub if empty
