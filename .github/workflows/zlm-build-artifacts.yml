@@ -29,11 +29,17 @@ jobs:
 
       - name: 子模块改用 GitHub 镜像（规避 gitee 不稳）
         run: |
-          git config submodule."3rdpart/ZLToolKit".url https://github.com/ZLMediaKit/ZLToolKit
-          git config submodule."3rdpart/media-server".url https://github.com/ireader/media-server
-          git config submodule."3rdpart/jsoncpp".url https://github.com/open-source-parsers/jsoncpp.git
-          git config submodule."3rdpart/pybind11".url https://github.com/pybind/pybind11.git
-          git config submodule."www/webassist".url https://github.com/1002victor/zlm_webassist
+          # 直接改写本地 .gitmodules 为 GitHub 镜像，再 sync。
+          # 注意：git submodule sync 会把 .git/config 的 url 回退成 .gitmodules 的值，
+          # 因此必须先改 .gitmodules（仅 runner 本地，不提交），再 sync，才能确保走 GitHub。
+          sed -i \
+            -e 's#https://gitee.com/xia-chu/ZLToolKit#https://github.com/ZLMediaKit/ZLToolKit#g' \
+            -e 's#https://gitee.com/ireader/media-server#https://github.com/ireader/media-server#g' \
+            -e 's#https://gitee.com/mirrors/jsoncpp.git#https://github.com/open-source-parsers/jsoncpp.git#g' \
+            -e 's#https://gitee.com/victor1002/zlm_webassist#https://github.com/1002victor/zlm_webassist#g' \
+            -e 's#https://gitee.com/mirrors/pybind11.git#https://github.com/pybind/pybind11.git#g' \
+            .gitmodules
+          echo "==> .gitmodules 改写后:" && cat .gitmodules
           git submodule sync
           # 重试，避免瞬时网络抖动
           for i in 1 2 3; do
