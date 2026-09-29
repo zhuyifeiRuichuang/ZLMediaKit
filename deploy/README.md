@@ -59,6 +59,19 @@ kubectl -n zlmediakit logs -f deploy/zlmediakit
 - 修改配置：编辑 `config/config.ini` 后 `kubectl create configmap zlm-config -n zlmediakit --from-file=config.ini --dry-run=client -o yaml | kubectl apply -f -`（或重新 apply `configmap.yaml`）。
 - 替换证书：将自有 `default.pem` 放入 `cert/`，或在 k8s 侧 `kubectl create secret generic zlm-cert -n zlmediakit --from-file=default.pem --dry-run=client -o yaml | kubectl apply -f -`。
 
+### api.secret（务必更换）
+
+`[api] secret` 不可使用 ZLMediaKit 上游默认值 `035c73f7-bb6b-4889-a715-d9eb2d1925cc`，也不可留空：
+服务端检测到此值会在启动时随机生成新 secret 并写回配置文件（`server/main.cpp`），
+日志为 `The api.secret is invalid, modified it to: ...`。后果：
+
+- **compose**：配置文件若可写会被容器改写，导致 Git 中的配置与实际运行值不一致；
+- **k8s**：ConfigMap 只读，写回失败，运行实例持有无人知晓的随机 secret，
+  所有 HTTP API 返回 `code=-100 "Please login first"`（`./index/api/getServerConfig` 等均无法调用）。
+
+本目录 `config/config.ini` 与 `k8s/configmap.yaml` 已使用专有的示例 secret，生产部署请替换为自有值，
+并同步到 ConfigMap（compose 侧 `config/` 以只读方式挂载，避免被容器改写）。
+
 ## 三、端口说明（与 conf/config.ini 默认一致）
 
 | 端口 | 协议 | 用途 |
@@ -79,17 +92,18 @@ kubectl -n zlmediakit logs -f deploy/zlmediakit
 
 | Job | 场景 | 环境 | 断言内容 |
 | --- | --- | --- | --- |
-| `deploy-test-compose-amd64` | docker compose | runner 原生 docker | 镜像架构=amd64、容器 healthy、`getServerConfig` code=0、1935/554 监听 |
-| `deploy-test-k8s-amd64` | Kubernetes | 单节点 kind 集群（`kind created cluster` + extraPortMappings） | 见下 |
+| `deploy-test-compose-amd64` | docker compose | runner 原生 docker | 镜像架构=amd64、容器 healthy、配置 secret 非上游默认且未被容器改写、`getServerConfig` code=0、1935/554 监听 |
+| `deploy-test-k8s-amd64` | Kubernetes | 单节点 kind 集群（`kind create cluster` + extraPortMappings） | 见下 |
 
-k8s job 覆盖点：
+k8s job 覆盖点（5 项断言）：
 
-1. **镜像版本绑定**：`sed` 把 `deployment.yaml` 的 `:latest` 替换为本次测试 `$IMAGE:$VERSION`，校验 Pod 实际使用镜像一致。
-2. **编排对象就绪**：按顺序 apply `namespace → configmap → secret → service → deployment`，`kubectl rollout status` + `Available` 条件等待通过。
-3. **运行态健康**：Pod phase=Running、Ready=True、`restartCount=0`（探针配置合理，未发生反复重启）。
-4. **挂载生效**：`ConfigMap(config.ini)` 与 `Secret(default.pem, subPath)` 在容器内均存在且非空。
-5. **hostNetwork 暴露**：集群端口经 kind `extraPortMappings`（80→30080、1935→31935、554→30554）在 runner 本机可访问；`getServerConfig` 返回 code=0，1935/554 可连通。
-6. **Service 转发**：`endpoints` 有可用地址，Pod 内经 ClusterIP:80 发起 HTTP 请求返回 200。
+1. **配置 secret 合法**：非上游默认值；容器内生效值与 ConfigMap 一致（未被服务端随机重写）。
+2. **镜像与运行态**：`sed` 把 `deployment.yaml` 的 `:latest` 替换为本次测试 `$IMAGE:$VERSION`，校验 Pod 实际使用镜像一致；Pod phase=Running、Ready=True 且 `restartCount=0`。
+3. **挂载生效**：`ConfigMap(config.ini)` 与 `Secret(default.pem, subPath)` 在容器内均存在且非空。
+4. **hostNetwork 暴露**：集群端口经 kind `extraPortMappings`（80→30080、1935→31935、554→30554）在 runner 本机可访问；`getServerConfig` 返回 code=0，1935/554 可连通。
+5. **Service 转发**：`endpoints` 有可用地址，Pod 内经 ClusterIP:80 发起 HTTP 请求返回 200 且业务 code=0。
+
+编排对象在 apply 前先做 `kubectl apply --dry-run=server` 预检（由 API Server 严格校验字段，如 Secret 卷须用 `secretName`）。
 
 > 流水线使用的 kubectl / kind 版本动态取自官方源（kubectl 取 `dl.k8s.io/release/stable.txt`，kind 取 GitHub `latest` release），不硬编码版本号。
 

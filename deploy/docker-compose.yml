@@ -9,7 +9,9 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
-      - ./config:/opt/media/conf
+      # config 只读挂载：ZLMediaKit 发现 api.secret 为上游默认值时会随机重写配置文件，
+      # 只读可避免宿主机配置文件被容器改写（此前正是被改写后才"看似"通过测试，见 CI 断言说明）
+      - ./config:/opt/media/conf:ro
       - ./cert/default.pem:/opt/media/bin/default.pem
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/80"]
